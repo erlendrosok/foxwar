@@ -17,7 +17,7 @@ it on your `PATH`.
        PariPk        Nevish        Moors         ViperP        Morgen
 Olavis        Gutter        Stncrd        Callhn        Wethr‼        Godcrf
        Palntn        Frran⚔        LinnM⚔        Marba⚔        Stlic⚔        Lykos⚔
-              Fshmn⚔        KngCa⚔        DEADL⚔        Clahs‼        Tempes
+              Fshmn⚔        KngCa⚔        Deadl⚔        Clahs‼        Tempes
        Oarbr⚔        Westgt        LochM⚔        Drownd        EndlsS        Finger
               Stema         Sablpr        Umbral        Allods        Wresta        Pipers
                      Origin        Hrtlnd        Shackl        Reaver        Tyrant

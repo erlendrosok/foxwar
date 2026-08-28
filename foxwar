@@ -99,7 +99,7 @@ HEXES = {
     "BasinSionnachHex":     (-3, 0, "Basin"),
     "StemaLandingHex":      (3, -4, "Stema"),
     "HeartlandsHex":        (2, -1, "Hrtlnds"),
-    "DeadLandsHex":         (0, 0, "DEADLND"),
+    "DeadLandsHex":         (0, 0, "Deadlnd"),
     "OarbreakerHex":        (3, -5, "Oarbrkr"),
     "AcrithiaHex":          (2, 1, "Acritha"),
     "WeatheredExpanseHex":  (-2, 2, "Wethrd"),
