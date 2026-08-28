@@ -1,0 +1,809 @@
+#!/usr/bin/env python3
+"""foxwar - Foxhole persistent-war status in the terminal.
+
+Data: the official Foxhole War API (war state, per-region casualties), the
+Steam concurrent-player count, and foxholestats.com's Live Event Log (scraped -
+it has 72h of history and no official equivalent). Renders casualties, the
+victory-town race, per-region control, an ASCII front-line map with invasion
+markers, and the capture log.
+
+Usage:
+  foxwar                 summary: victory-town race, per-side casualties and
+                         rate, players, invasion alerts, last 8 events
+  foxwar map             ASCII hex map; regions with an invasion alert are flagged
+  foxwar regions         table: control, per-side casualties and rate
+  foxwar events [N]      last N base/structure events (default 30)
+  foxwar watch [SECS]    live: map + most-active regions + events + summary (60s)
+  foxwar poll [SECS]     headless: refresh casualty tracking, print new events
+  foxwar tmux            one compact line for a tmux status bar
+
+Options:
+  --shard N              live shard 1, 2 or 3            (env FOXWAR_SHARD)
+  --no-color             plain output
+  --blink                blink the invasion-alert markers
+
+A region is 'contested' (⚔) when both factions hold a base in it (town, relic
+or keep). A real Foxhole invasion (an enemy-held border base pushing into a hex
+you still fully own, ending when they take a base) isn't in any API; foxwar
+raises an INVASION ALERT (‼) when foxholestats logged a base captured/started
+there in the last 45 min (FOXWAR_INVASION_WINDOW) or a fully-owned front-line
+hex's casualty rate is clearly elevated (FOXWAR_HOT_RATE etc).
+
+The event log comes straight from foxholestats so it's populated on first run.
+Casualty rates need ~2 min of local history and sharpen over ~30 min; keep
+`foxwar poll` (the foxwar-poll systemd service) or the tmux bar running to
+build it. Everything is cached under ~/.cache/foxwar.
+"""
+from __future__ import annotations
+
+import concurrent.futures
+import gzip
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+
+SHARD = os.environ.get("FOXWAR_SHARD", "1")
+CACHE = os.path.expanduser("~/.cache/foxwar")
+# True invasions (an enemy-held border base pushing into a still-owned hex,
+# ending when a town/relic base falls) are not in the public API, so foxwar
+# approximates an INVASION ALERT: a town changed hands in the last 45 min
+# (INVASION_WINDOW), or a fully-owned front-line hex whose 30-min casualty rate
+# is above HOT_FLOOR and either over HOT_RATE outright or REL_MULT x the median
+# active hex (so "clearly the main push" trips it even in a quiet war). Once
+# both factions hold a base in the hex it reads as 'contested' (⚔) instead.
+INVASION_WINDOW = int(os.environ.get("FOXWAR_INVASION_WINDOW", "2700"))
+HOT_RATE = float(os.environ.get("FOXWAR_HOT_RATE", "10"))     # deaths/min
+HOT_FLOOR = float(os.environ.get("FOXWAR_HOT_FLOOR", "4"))
+REL_MULT = float(os.environ.get("FOXWAR_HOT_REL", "3"))
+HOT_COOLDOWN = float(os.environ.get("FOXWAR_HOT_COOLDOWN", "1800"))  # 30 min
+RATE_WINDOW = 1800   # average casualties over up to this many seconds
+RATE_KEEP = 2700     # keep this much casualty history per region
+RATE_MIN = float(os.environ.get("FOXWAR_RATE_MIN", "2")) * 60   # min history
+
+# ---- region layout (q, p) + short labels -----------------------------------
+# q,p from the community "foxhole-hexes" layout; DeadLands is the origin.
+# Screen mapping (see asciimap): column = p, line = 2q + p.
+HEXES = {
+    "TheFingersHex":        (-2, 5, "Fingers"),
+    "KuuraStrandHex":       (0, -4, "Kuura"),
+    "TempestIslandHex":     (-2, 4, "Tempest"),
+    "MarbanHollow":         (-1, 1, "Marban"),
+    "GutterHex":            (1, -4, "Gutter"),
+    "EndlessShoreHex":      (-1, 3, "EndlsSh"),
+    "WrestaHex":            (-1, 4, "Wresta"),
+    "TyrantFoothillsHex":   (-1, 5, "Tyrant"),
+    "WestgateHex":          (2, -3, "Westgte"),
+    "MooringCountyHex":     (-1, -1, "Moors"),
+    "MorgensCrossingHex":   (-3, 3, "Morgens"),
+    "LochMorHex":           (1, -1, "LochMor"),
+    "RedRiverHex":          (3, -1, "RedRivr"),
+    "HowlCountyHex":        (-3, 1, "Howl"),
+    "ClahstraHex":          (-1, 2, "Clahstr"),
+    "TerminusHex":          (1, 2, "Termins"),
+    "LinnMercyHex":         (0, -1, "LinnM"),
+    "PipersEnclaveHex":     (-2, 6, "Pipers"),
+    "ClansheadValleyHex":   (-3, 2, "Clnshd"),
+    "GodcroftsHex":         (-3, 4, "Godcrft"),
+    "FishermansRowHex":     (2, -4, "Fshmns"),
+    "UmbralWildwoodHex":    (1, 0, "Umbral"),
+    "CallahansPassageHex":  (-1, 0, "Callhns"),
+    "LykosIsleHex":         (-3, 5, "Lykos"),
+    "KingsCageHex":         (1, -2, "KngCage"),
+    "SableportHex":         (2, -2, "Sablprt"),
+    "GreatMarchHex":        (2, 0, "GrtMrch"),
+    "ViperPitHex":          (-2, 1, "ViperP"),
+    "BasinSionnachHex":     (-3, 0, "Basin"),
+    "StemaLandingHex":      (3, -4, "Stema"),
+    "HeartlandsHex":        (2, -1, "Hrtlnds"),
+    "DeadLandsHex":         (0, 0, "DEADLND"),
+    "OarbreakerHex":        (3, -5, "Oarbrkr"),
+    "AcrithiaHex":          (2, 1, "Acritha"),
+    "WeatheredExpanseHex":  (-2, 2, "Wethrd"),
+    "ReaversPassHex":       (0, 3, "Reavers"),
+    "StonecradleHex":       (0, -2, "Stncrdl"),
+    "PariPeakHex":          (1, -5, "PariPk"),
+    "KalokaiHex":           (3, 0, "Kalokai"),
+    "AllodsBightHex":       (0, 2, "Allods"),
+    "OriginHex":            (3, -3, "Origin"),
+    "OlavisWakeHex":        (2, -6, "Olavis"),
+    "SpeakingWoodsHex":     (-2, -1, "SpkWds"),
+    "ShackledChasmHex":     (1, 1, "Shackld"),
+    "NevishLineHex":        (0, -3, "Nevish"),
+    "CallumsCapeHex":       (-1, -2, "Callums"),
+    "ReachingTrailHex":     (-2, 0, "Reachng"),
+    "StlicanShelfHex":      (-2, 3, "Stlican"),
+    "PalantineBermHex":     (2, -5, "Palntne"),
+    "AshFieldsHex":         (3, -2, "AshFlds"),
+    "FarranacCoastHex":     (1, -3, "Frranac"),
+    "DrownedValeHex":       (0, 1, "Drownd"),
+    "OnyxHex":              (0, 4, "Onyx"),
+}
+
+# ---- flags / colour ------------------------------------------------------
+NO_COLOR = "--no-color" in sys.argv or not sys.stdout.isatty()
+for _f in ("--no-color",):
+    if _f in sys.argv:
+        sys.argv.remove(_f)
+BLINK = "--blink" in sys.argv
+if BLINK:
+    sys.argv.remove("--blink")
+if "--shard" in sys.argv:
+    _i = sys.argv.index("--shard")
+    SHARD = sys.argv[_i + 1]
+    del sys.argv[_i:_i + 2]
+
+
+def c(s, code):
+    return s if NO_COLOR else f"\033[{code}m{s}\033[0m"
+
+
+COL = lambda s: c(s, "32")            # Colonial - green
+WAR = lambda s: c(s, "34;1")          # Warden - bright blue
+CON = lambda s: c(s, "33")            # contested - yellow
+NEU = lambda s: c(s, "90")            # neutral / muted - grey
+BOLD = lambda s: c(s, "1")
+ALERT = lambda s: c(s, ("5;" if BLINK else "") + "1;97;41")  # invasion alert
+
+TINT = {"colonial": COL, "warden": WAR, "contested": CON, "neutral": NEU}
+
+# ---- API ---------------------------------------------------------------
+ROOT = {
+    "1": "https://war-service-live.foxholeservices.com/api",
+    "2": "https://war-service-live-2.foxholeservices.com/api",
+    "3": "https://war-service-live-3.foxholeservices.com/api",
+}.get(SHARD, "https://war-service-live.foxholeservices.com/api")
+
+
+def api(path):
+    """GET with on-disk ETag revalidation."""
+    os.makedirs(CACHE, exist_ok=True)
+    key = os.path.join(CACHE, path.strip("/").replace("/", "_") + f".s{SHARD}.json")
+    etag, cached = None, None
+    if os.path.exists(key):
+        try:
+            with open(key) as f:
+                cached = json.load(f)
+            etag = cached.get("__etag")
+        except (OSError, ValueError):
+            cached = None
+    req = urllib.request.Request(ROOT + path, headers={"User-Agent": "foxwar-cli"})
+    if etag:
+        req.add_header("If-None-Match", etag)
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            data = json.load(r)
+            data["__etag"] = r.headers.get("ETag")
+            with open(key, "w") as f:
+                json.dump(data, f)
+            return data
+    except urllib.error.HTTPError as e:
+        if e.code == 304 and cached is not None:
+            return cached
+        raise
+
+
+# keep, relic base, town base t1-3 - the capturable bases that mark a foothold
+BASE_ICONS = (27, 45, 56, 57, 58)
+
+
+def hex_data(name):
+    try:
+        d = api(f"/worldconquest/maps/{name}/dynamic/public")
+    except Exception:
+        d = {"mapItems": [], "version": None, "lastUpdated": 0}
+    try:
+        rep = api(f"/worldconquest/warReport/{name}")
+    except Exception:
+        rep = {}
+
+    held = {"COLONIALS": 0, "WARDENS": 0}
+    vt = {"COLONIALS": 0, "WARDENS": 0}
+    for m in d.get("mapItems", []):
+        it, t, fl = m["iconType"], m["teamId"], m.get("flags", 0)
+        if it not in BASE_ICONS or fl & 0x04:   # skip build sites
+            continue
+        if t in held:
+            held[t] += 1
+        if fl & 0x01 and not fl & 0x10 and t in vt:   # victory base, not scorched
+            vt[t] += 1
+
+    c_, w_ = held["COLONIALS"], held["WARDENS"]
+    if c_ and w_:               # both factions hold a base -> a foothold each
+        ctrl = "contested"
+    elif c_ or w_:
+        ctrl = "colonial" if c_ > w_ else "warden"
+    else:
+        ctrl = "neutral"
+
+    return {
+        "ctrl": ctrl, "vt": vt,
+        "col_cas": rep.get("colonialCasualties", 0),
+        "war_cas": rep.get("wardenCasualties", 0),
+        "enlist": rep.get("totalEnlistments", 0),
+        "day": rep.get("dayOfWar", 0),
+    }
+
+
+def fetch_all():
+    war = api("/worldconquest/war")
+    out = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        for name, d in zip(HEXES, ex.map(hex_data, HEXES)):
+            out[name] = d
+    return war, out
+
+
+# ---- casualty / hot-region tracking --------------------------------
+STATE = os.path.join(CACHE, f"state.s{SHARD}.json")
+STATE_FMT = 5
+
+
+def _load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_state(obj):
+    tmp = STATE + f".{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, STATE)
+
+
+def track(war, hexes):
+    """Refresh the rolling per-region casualty rate and the 'hot' front-line
+    set in state.s{N}.json. Every foxwar process writes this one file; a newer
+    on-disk format means a newer foxwar is running too, so bail rather than
+    clobber it."""
+    st = _load_state()
+    if st.get("fmt", 0) > STATE_FMT:
+        return
+    fresh = st.get("war") != war["warNumber"] or st.get("fmt") != STATE_FMT
+    prev_cas = {} if fresh else st.get("cas", {})
+    prev_hot = {} if fresh else (st.get("hot") or {})
+    now = time.time()
+    cas, hot, rate = {}, {}, {}
+    for name, h in hexes.items():
+        # casualties only ever climb; a drop means a bad fetch - skip it
+        hist = [] if fresh else list(prev_cas.get(name, []))
+        deaths = h["col_cas"] + h["war_cas"]
+        if not hist or deaths >= hist[-1][1] + hist[-1][2]:
+            hist.append([now, h["col_cas"], h["war_cas"]])
+        hist = [pt for pt in hist if now - pt[0] <= RATE_KEEP]
+        cas[name] = hist
+        ref = next((pt for pt in hist if now - pt[0] <= RATE_WINDOW), hist[0])
+        span = now - ref[0]
+        if span >= RATE_MIN and deaths >= ref[1] + ref[2]:
+            rate[name] = (deaths - ref[1] - ref[2]) / (span / 60)
+
+    active = sorted(r for r in rate.values() if r > 1)
+    median = active[len(active) // 2] if active else 0.0
+    for name, r in rate.items():
+        h = hexes[name]
+        frontline = h["ctrl"] in ("colonial", "warden") and any(
+            hexes[n]["ctrl"] == ("warden" if h["ctrl"] == "colonial" else "colonial")
+            for n in _neighbours(name))
+        elevated = r >= HOT_FLOOR and (r >= HOT_RATE or r >= REL_MULT * median)
+        until = (prev_hot.get(name) or [0])[0]
+        if frontline and elevated:
+            until = now + HOT_COOLDOWN
+        if until > now:
+            hot[name] = [until, r]
+
+    _save_state({"fmt": STATE_FMT, "war": war["warNumber"], "ts": now,
+                 "cas": cas, "hot": hot})
+
+
+# ---- event log (foxholestats.com Live Event Log) -------------------
+FHS_URL = "https://foxholestats.com/index.php?slim=1"
+FHS_CACHE = os.path.join(CACHE, "fhs_events.json")
+FHS_TTL = int(os.environ.get("FOXWAR_FHS_TTL", "120"))
+
+# foxholestats display name -> our HEXES key
+FHS_REGION = {
+    "Acrithia": "AcrithiaHex", "Allods Bight": "AllodsBightHex",
+    "Ash Fields": "AshFieldsHex", "Basin Sionnach": "BasinSionnachHex",
+    "Callahans Passage": "CallahansPassageHex", "Callums Cape": "CallumsCapeHex",
+    "The Clahstra": "ClahstraHex", "Clanshead Valley": "ClansheadValleyHex",
+    "Deadlands": "DeadLandsHex", "The Drowned Vale": "DrownedValeHex",
+    "Endless Shore": "EndlessShoreHex", "Farranac Coast": "FarranacCoastHex",
+    "Fishermans Row": "FishermansRowHex", "Godcrofts": "GodcroftsHex",
+    "Great March": "GreatMarchHex", "The Gutter": "GutterHex",
+    "The Heartlands": "HeartlandsHex", "Howl County": "HowlCountyHex",
+    "Kalokai": "KalokaiHex", "Kings Cage": "KingsCageHex",
+    "Kuura Strand": "KuuraStrandHex", "The Linn of Mercy": "LinnMercyHex",
+    "Loch Mór": "LochMorHex", "Lykos Isle": "LykosIsleHex",
+    "Marban Hollow": "MarbanHollow", "The Moors": "MooringCountyHex",
+    "Morgens Crossing": "MorgensCrossingHex", "Nevish Line": "NevishLineHex",
+    "Oarbreaker Isles": "OarbreakerHex", "Olavis Wake": "OlavisWakeHex",
+    "Onyx": "OnyxHex", "Origin": "OriginHex", "Palantine Berm": "PalantineBermHex",
+    "Pari Peak": "PariPeakHex", "Pipers Enclave": "PipersEnclaveHex",
+    "Reaching Trail": "ReachingTrailHex", "Reavers Pass": "ReaversPassHex",
+    "Red River": "RedRiverHex", "Sableport": "SableportHex",
+    "Shackled Chasm": "ShackledChasmHex", "Speaking Woods": "SpeakingWoodsHex",
+    "Stema Landing": "StemaLandingHex", "Stlican Shelf": "StlicanShelfHex",
+    "Stonecradle": "StonecradleHex", "Tempest Island": "TempestIslandHex",
+    "Terminus": "TerminusHex", "The Fingers": "TheFingersHex",
+    "Tyrant Foothills": "TyrantFoothillsHex", "Umbral Wildwood": "UmbralWildwoodHex",
+    "Viper Pit": "ViperPitHex", "Weathered Expanse": "WeatheredExpanseHex",
+    "Westgate": "WestgateHex", "Wresta": "WrestaHex",
+}
+
+_FHS_LI = re.compile(
+    r"data-iconType='(\d+)'[^>]*title='\[(\d+)\]'>.*?<img\b[^>]*>\s*"
+    r"([^<]+?)\s*</span>.*?class='time'>(\d+)</span>", re.S)
+_FHS_TXT = re.compile(
+    r"^(.*?)\s+-\s+(.*?) was ([A-Za-z0-9 ]+?) by (Colonials|Wardens)\b", re.S)
+_FHS_KIND = {"Taken": "capture", "Under": "build", "Lost": "lost",
+             "Upgraded": "upgrade"}
+BASE_EVENT_ICONS = {8, 27, 45, 56, 57, 58}
+
+
+def fhs_events():
+    """The foxholestats Live Event Log, oldest first. Cached FHS_TTL secs;
+    on failure falls back to the cache, then []."""
+    cached = None
+    try:
+        with open(FHS_CACHE) as f:
+            cached = json.load(f)
+        if time.time() - cached["ts"] < FHS_TTL:
+            return cached["events"]
+    except (OSError, ValueError, KeyError):
+        pass
+    try:
+        req = urllib.request.Request(FHS_URL, headers={
+            "User-Agent": "foxwar-cli", "Accept-Encoding": "gzip"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            raw = r.read()
+            if r.headers.get("Content-Encoding") == "gzip":
+                raw = gzip.decompress(raw)
+        html = raw.decode("utf-8", "replace")
+    except Exception:
+        return cached["events"] if cached else []
+
+    evs = []
+    for icon, eid, body, ts in _FHS_LI.findall(html):
+        m = _FHS_TXT.match(body)
+        if not m:
+            continue
+        region, struct, verb, team = m.groups()
+        evs.append({
+            "id": int(eid), "ts": int(ts), "icon": int(icon),
+            "to": "COLONIALS" if team == "Colonials" else "WARDENS",
+            "region": region.strip(), "struct": struct.strip(),
+            "kind": _FHS_KIND.get(verb.strip().split()[0], "other"),
+        })
+    evs.sort(key=lambda e: e["id"])
+    evs = evs[-400:]
+    try:
+        os.makedirs(CACHE, exist_ok=True)
+        with open(FHS_CACHE, "w") as f:
+            json.dump({"ts": time.time(), "events": evs}, f)
+    except OSError:
+        pass
+    return evs
+
+
+_AXIAL_DIRS = [(-1, 0), (-1, 1), (0, 1), (1, 0), (1, -1), (0, -1)]
+_QP = {n: (q, p) for n, (q, p, _) in HEXES.items()}
+_BY_QP = {v: k for k, v in _QP.items()}
+
+
+def _neighbours(name):
+    q, p = _QP[name]
+    return [_BY_QP[(q + dq, p + dp)] for dq, dp in _AXIAL_DIRS
+            if (q + dq, p + dp) in _BY_QP]
+
+
+def current_invasions(hexes):
+    """Region -> {'reason': 'capture'|'battle', 'rate': deaths/min or None}.
+
+    'battle' hexes come from track() (front line + elevated casualty rate);
+    'capture' hexes had a base captured/started (per foxholestats) within
+    INVASION_WINDOW in a region the gaining faction doesn't control. Once both
+    factions hold a base the hex is 'contested' instead - see asciimap.
+    """
+    now = time.time()
+    hot = {}
+    for name, v in (_load_state().get("hot") or {}).items():
+        if isinstance(v, list) and len(v) >= 2 and v[0] > now:
+            hot[name] = v[1]
+
+    inv = {name: {"reason": "battle", "rate": r} for name, r in hot.items()
+           if hexes.get(name, {}).get("ctrl") != "contested"}
+    for e in fhs_events():
+        if (now - e["ts"] >= INVASION_WINDOW or e["kind"] not in ("capture", "build")
+                or e["icon"] not in BASE_EVENT_ICONS):
+            continue
+        name = FHS_REGION.get(e["region"])
+        ctrl = hexes.get(name, {}).get("ctrl")
+        gain = "colonial" if e["to"] == "COLONIALS" else "warden"
+        # a breakthrough into a hex the enemy still holds outright - not a
+        # retake, and not just more back-and-forth in an already-contested hex
+        if name and ctrl not in (gain, "contested"):
+            inv.setdefault(name, {"rate": hot.get(name)})["reason"] = "capture"
+    return inv
+
+
+PLAYERS_CACHE = os.path.join(CACHE, "players.json")
+STEAM_URL = ("https://api.steampowered.com/ISteamUserStats/"
+             "GetNumberOfCurrentPlayers/v1/?appid=505460")  # Foxhole, all shards
+
+
+def player_count():
+    """Steam concurrent players for Foxhole (global, not per-shard). Cached 3 min."""
+    try:
+        with open(PLAYERS_CACHE) as f:
+            o = json.load(f)
+        if time.time() - o["ts"] < 180:
+            return o["n"]
+    except (OSError, ValueError, KeyError):
+        o = None
+    try:
+        req = urllib.request.Request(STEAM_URL, headers={"User-Agent": "foxwar-cli"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            n = int(json.load(r)["response"]["player_count"])
+        os.makedirs(CACHE, exist_ok=True)
+        with open(PLAYERS_CACHE, "w") as f:
+            json.dump({"ts": time.time(), "n": n}, f)
+        return n
+    except Exception:
+        return o["n"] if o else None
+
+
+def recent_block(n=8):
+    return events_view(n, indent="  ")
+
+
+# ---- rendering -------------------------------------------------------
+def totals(war, hexes):
+    col = sum(h["col_cas"] for h in hexes.values())
+    wr = sum(h["war_cas"] for h in hexes.values())
+    enl = sum(h["enlist"] for h in hexes.values())
+    day = max((h["day"] for h in hexes.values()), default=0)
+    cvt = sum(h["vt"]["COLONIALS"] for h in hexes.values())
+    wvt = sum(h["vt"]["WARDENS"] for h in hexes.values())
+    return col, wr, enl, day, cvt, wvt
+
+
+def region_rates():
+    """{region: (colonial/min, warden/min)} over RATE_WINDOW. Empty until the
+    casualty history is deep enough. Format-tolerant: reads whatever `cas`
+    entries look like [ts, colonial, warden], regardless of state fmt, so a
+    still-running older foxwar keeps showing rates the poll service writes."""
+    now = time.time()
+    out = {}
+    for name, hist in (_load_state().get("cas") or {}).items():
+        pts = [p for p in hist if isinstance(p, list) and len(p) >= 3]
+        if len(pts) < 2:
+            continue
+        cur = pts[-1]
+        ref = next((p for p in pts if now - p[0] <= RATE_WINDOW), pts[0])
+        span = cur[0] - ref[0]
+        if span >= RATE_MIN:
+            mins = span / 60
+            out[name] = (max(0.0, cur[1] - ref[1]) / mins,
+                         max(0.0, cur[2] - ref[2]) / mins)
+    return out
+
+
+def casualty_rates():
+    """Map-wide (colonial/min, warden/min), or None if not enough history."""
+    rr = region_rates()
+    if not rr:
+        return None
+    return (sum(c for c, _ in rr.values()), sum(w for _, w in rr.values()))
+
+
+def _cas_ages():
+    now = time.time()
+    return [now - h[0][0] for h in (_load_state().get("cas") or {}).values()
+            if h and isinstance(h[0], list) and len(h[0]) >= 3]
+
+
+def rate_span_min():
+    """Effective averaging window: grows with history, capped at RATE_WINDOW."""
+    ages = _cas_ages()
+    return min(RATE_WINDOW, max(ages)) / 60 if ages else 0.0
+
+
+def rate_status():
+    """None once casualty rates are live, else a short 'warming up' note."""
+    if region_rates():
+        return None
+    ages = _cas_ages()
+    have = (max(ages) / 60) if ages else 0.0
+    poll = "" if ages else " - start `foxwar poll` or keep this open"
+    return f"casualty rates warming up ({have:.0f} of {RATE_MIN / 60:.0f} min){poll}"
+
+
+def bar(frac, width=32):
+    n = round(frac * width)
+    return COL("█" * n) + WAR("█" * (width - n))
+
+
+def _invasion_line(invasions):
+    if not invasions:
+        return NEU("No invasion alerts.")
+    parts = []
+    for r in sorted(invasions, key=lambda r: HEXES[r][2].lower()):
+        info = invasions[r]
+        rate, reason = info.get("rate"), info.get("reason")
+        if reason == "capture":
+            tag = " capture"
+        elif rate:
+            tag = f" {rate:.0f}/min"
+        else:
+            tag = ""
+        parts.append(CON(HEXES[r][2]) + NEU(tag))
+    return ALERT(f" ‼ INVASION ALERT ({len(invasions)}) ") + "  " + "  ".join(parts)
+
+
+def summary(war, hexes, invasions, players=None):
+    col, wr, enl, day, cvt, wvt = totals(war, hexes)
+    tot = col + wr or 1
+    need = war["requiredVictoryTowns"]
+    winner = war["winner"]
+    rates = casualty_rates()
+    cr = (f"  {COL(f'+{rates[0] * 60:,.0f}/hr')}",
+          f"  {WAR(f'+{rates[1] * 60:,.0f}/hr')}") if rates else ("", "")
+    L = [BOLD(f"War #{war['warNumber']}   Day {day}")
+         + (f"   {c('WINNER: ' + winner, '1;33')}" if winner != "NONE" else ""),
+         "",
+         f"Victory towns   {COL(str(cvt))} Colonial   {WAR(str(wvt))} Warden"
+         f"   (need {need} to win)",
+         "  " + bar(cvt / max(cvt + wvt, 1)),
+         "",
+         f"Casualties      {COL(f'{col:>10,}')}  {col / tot:5.1%} Colonial{cr[0]}",
+         f"                {WAR(f'{wr:>10,}')}  {wr / tot:5.1%} Warden{cr[1]}",
+         "  " + bar(col / tot),
+         f"Total dead      {col + wr:>10,}" + (
+             f"   {NEU(f'({(rates[0] + rates[1]) * 60:,.0f}/hr, {rate_span_min():.0f}-min avg)')}"
+             if rates else f"   {NEU('(' + rate_status() + ')')}"),
+         f"Enlistments     {enl:>10,}"]
+    if players is not None:
+        L.append(f"Steam players   {players:>10,}  in-game now")
+    L += ["", _invasion_line(invasions),
+          "", BOLD("Recent events") + NEU("  (foxholestats.com)"), recent_block(8)]
+    return "\n".join(L)
+
+
+def regions(war, hexes, invasions, limit=None, by="dead"):
+    rr = region_rates()
+    if by == "rate" and rr:
+        rows = sorted(hexes.items(), key=lambda kv: -sum(rr.get(kv[0], (0, 0))))
+    else:
+        rows = sorted(hexes.items(),
+                      key=lambda kv: -(kv[1]["col_cas"] + kv[1]["war_cas"]))
+    if limit:
+        rows = rows[:limit]
+    out = [BOLD(f"{'Region':<11}{'Control':<11}{'':2}"
+               f"{'dead C':>10} /{'dead W':>10}   {'C/hr':>6} {'W/hr':>6}")]
+    for name, h in rows:
+        ctrl = h["ctrl"]
+        flag = (ALERT("‼") if name in invasions
+                else CON("⚔") if ctrl == "contested" else " ")
+        cpm, wpm = rr.get(name, (None, None))
+        cr = COL(f"{cpm * 60:>6,.0f}") if cpm else f"{('·' if cpm == 0 else ''):>6}"
+        wrt = WAR(f"{wpm * 60:>6,.0f}") if wpm else f"{('·' if wpm == 0 else ''):>6}"
+        out.append(f"{HEXES[name][2]:<11}{TINT[ctrl](f'{ctrl:<11}')}{flag} "
+                   f"{h['col_cas']:>10,} /{h['war_cas']:>10,}   {cr} {wrt}")
+    return "\n".join(out)
+
+
+def _vislen(s):
+    return len(re.sub(r"\033\[[0-9;]*m", "", s))
+
+
+def asciimap(war, hexes, invasions):
+    # Foxhole flat-top hex grid. Layout (q, p) -> screen:
+    #   column = p          (west -> east)
+    #   line   = 2q + p     (north -> south; +/-1 per column so columns interleave)
+    import shutil
+    cells = {(p, 2 * q + p): name for name, (q, p, _) in HEXES.items()}
+    cmin, cmax = min(c for c, _ in cells), max(c for c, _ in cells)
+    lmin, lmax = min(l for _, l in cells), max(l for _, l in cells)
+
+    ncols = cmax - cmin + 1
+    termw = shutil.get_terminal_size((110, 24)).columns
+    cw = max(5, min(11, termw // ncols))
+    lw = cw - 1
+    wide = cw >= 10
+
+    rows = []
+    for ln in range(lmin, lmax + 1):
+        line = ""
+        for cp in range(cmin, cmax + 1):
+            if (cp, ln) not in cells:
+                continue
+            name = cells[(cp, ln)]
+            h = hexes[name]
+            if name in invasions:
+                cell = ALERT(HEXES[name][2][:lw - 1] + "‼")
+            elif h["ctrl"] == "contested":
+                cell = TINT["contested"](HEXES[name][2][:lw - 1] + "⚔")
+            else:
+                cell = TINT[h["ctrl"]](HEXES[name][2][:lw])
+            line += " " * max(0, (cp - cmin) * cw - _vislen(line)) + cell
+        rows.append(line.rstrip())
+
+    legend = (f"{COL('colonial')}  {WAR('warden')}  {CON('contested ⚔')}  "
+              f"{NEU('neutral')}  {ALERT(' ‼ invasion alert ')}")
+    return "\n".join(rows) + "\n\n" + legend
+
+
+_VERB = {"capture": "took", "build": "building", "lost": "lost",
+         "upgrade": "upgraded"}
+
+
+def fmt_event(e, with_date=False):
+    stamp = time.strftime("%b %d %H:%M" if with_date else "%H:%M",
+                          time.localtime(e["ts"]))
+    tint = COL if e["to"] == "COLONIALS" else WAR
+    who = "Colonials" if e["to"] == "COLONIALS" else "Wardens"
+    verb = _VERB.get(e["kind"], e["kind"])
+    return (f"{NEU(stamp)}  {tint(who + ' ' + verb)} {e['struct']} "
+            f"{NEU('- ' + e['region'])}")
+
+
+def events_view(n, indent=""):
+    evs = fhs_events()
+    if not evs:
+        return NEU(indent + "Event log unavailable (couldn't reach foxholestats.com).")
+    shown = evs[-n:]
+    multiday = time.time() - shown[0]["ts"] > 86400
+    return "\n".join(indent + fmt_event(e, multiday) for e in shown)
+
+
+# ---- tmux segment ----------------------------------------------------
+TMUX_LINE = os.path.join(CACHE, f"tmux.s{SHARD}.line")
+TMUX_TTL = int(os.environ.get("FOXWAR_TMUX_TTL", "300"))
+
+
+def tmux_line(war, hexes, invasions, players=None):
+    col, wr, _, day, cvt, wvt = totals(war, hexes)
+    tot = col + wr or 1
+    lead = cvt - wvt
+    arrow = "C+" if lead > 0 else ("W+" if lead < 0 else "=")
+    s = f"FH{war['warNumber']} d{day}  VT {cvt}-{wvt} {arrow}{abs(lead)}  ☠ {col / tot * 100:.0f}/{wr / tot * 100:.0f}"
+    if players is not None:
+        s += f"  {players / 1000:.1f}k" if players >= 1000 else f"  {players}"
+    if invasions:
+        s += f"  ‼{len(invasions)}"
+    return s
+
+
+def tmux_cached():
+    fresh = (os.path.exists(TMUX_LINE)
+             and time.time() - os.path.getmtime(TMUX_LINE) < TMUX_TTL)
+    if not fresh:
+        import subprocess
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--shard", SHARD,
+             "_tmux_refresh"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+    try:
+        with open(TMUX_LINE) as f:
+            return f.read().strip()
+    except OSError:
+        return "FH …"
+
+
+def tmux_refresh():
+    os.makedirs(CACHE, exist_ok=True)
+    try:
+        war, hexes = fetch_all()
+        track(war, hexes)
+        line = tmux_line(war, hexes, current_invasions(hexes), player_count())
+    except Exception:
+        return
+    tmp = TMUX_LINE + f".{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        f.write(line)
+    os.replace(tmp, TMUX_LINE)
+
+
+# ---- main ----------------------------------------------------------
+def _clear():
+    sys.stdout.write("\033[H\033[2J")
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "summary"
+    arg2 = sys.argv[2] if len(sys.argv) > 2 else None
+
+    if mode == "tmux":
+        print(tmux_cached())
+        return
+    if mode == "_tmux_refresh":
+        tmux_refresh()
+        return
+
+    if mode in ("events", "ev", "log"):
+        print(events_view(int(arg2) if arg2 else 30))
+        return
+
+    if mode == "poll":
+        secs = int(arg2) if arg2 else 60
+        print(NEU(f"foxwar poll - shard {SHARD}, casualty tracking every {secs}s. "
+                  "Ctrl-C to quit."), flush=True)
+        seen = set()
+        try:
+            while True:
+                try:
+                    war, hexes = fetch_all()
+                    track(war, hexes)
+                    for e in fhs_events():          # served from cache mostly
+                        if seen and e["id"] not in seen:
+                            print(fmt_event(e), flush=True)
+                        seen.add(e["id"])
+                except Exception as exc:
+                    print(NEU(f"({exc})"), flush=True)
+                time.sleep(secs)
+        except KeyboardInterrupt:
+            return
+
+    if mode == "watch":
+        secs = int(arg2) if arg2 else 60
+        try:
+            while True:
+                war, hexes = fetch_all()
+                track(war, hexes)
+                invasions = current_invasions(hexes)
+                _clear()
+                print(asciimap(war, hexes, invasions))
+                print()
+                print(_invasion_line(invasions))
+                print()
+                rs = rate_status()
+                print(BOLD("Most active regions")
+                      + (NEU("  - " + rs) if rs else ""))
+                print(regions(war, hexes, invasions, limit=6, by="rate"))
+                print()
+                print(BOLD("Recent events") + NEU("  (foxholestats.com)"))
+                print(events_view(10))
+                print()
+                col, wr, _, day, cvt, wvt = totals(war, hexes)
+                pc = player_count()
+                rates = casualty_rates()
+                dead = (f"☠ {COL(f'+{rates[0] * 60:,.0f}')}/{WAR(f'+{rates[1] * 60:,.0f}')}/hr"
+                        if rates else f"☠ {col + wr:,}")
+                print(f"War #{war['warNumber']}  Day {day}   "
+                      f"VT {COL(str(cvt))}-{WAR(str(wvt))}/{war['requiredVictoryTowns']}"
+                      f"   {dead}" + (f"   {pc:,} players" if pc else ""))
+                print(NEU(f"updated {time.strftime('%H:%M:%S')} - Ctrl-C to quit"))
+                sys.stdout.flush()
+                time.sleep(secs)
+        except KeyboardInterrupt:
+            return
+
+    if mode not in ("summary", "sum", "map", "regions", "reg", "all", "full"):
+        print(__doc__)
+        sys.exit(0 if mode in ("-h", "--help", "help") else 1)
+
+    war, hexes = fetch_all()
+    track(war, hexes)   # every read view also advances casualty tracking
+    invasions = current_invasions(hexes)
+
+    if mode in ("summary", "sum"):
+        print(summary(war, hexes, invasions, player_count()))
+    elif mode == "map":
+        print(asciimap(war, hexes, invasions))
+    elif mode in ("regions", "reg"):
+        print(regions(war, hexes, invasions))
+    elif mode in ("all", "full"):
+        print(asciimap(war, hexes, invasions))
+        print()
+        print(summary(war, hexes, invasions, player_count()))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,17 @@
+[Unit]
+Description=foxwar - poll the Foxhole war API and log region captures
+Documentation=file:%h/.local/bin/foxwar
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=FOXWAR_SHARD=1 PYTHONUNBUFFERED=1 FOXWAR_FHS_TTL=300
+ExecStart=%h/.local/bin/foxwar poll 60
+Restart=always
+RestartSec=30
+Nice=10
+
+[Install]
+WantedBy=default.target
