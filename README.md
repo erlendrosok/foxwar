@@ -32,6 +32,9 @@ War #140   Day 75
 Victory towns   24 Colonial   17 Warden   (need 34 to win)
   ████████████████████████████████
 
+Bases held      243 Colonial   188 Warden   (relic + town)
+  ████████████████████████████████
+
 Casualties         196,806  46.5% Colonial  +3,539/hr
                    226,121  53.5% Warden  +3,912/hr
   ████████████████████████████████
@@ -64,9 +67,9 @@ Requires Python 3.7+ and nothing else — no `pip install`.
 
 | Command | What it shows |
 | --- | --- |
-| `foxwar` | Summary: victory-town race, per-side casualties + rate, players, invasion alerts, last 8 events |
+| `foxwar` | Summary: victory-town race, bases held, per-side casualties + rate, players, invasion alerts, last 8 events |
 | `foxwar map` | ASCII hex map, coloured by control. `⚔` contested, `‼` invasion alert |
-| `foxwar regions` | Table of every region: control, per-side dead, per-side rate (deaths/hr) |
+| `foxwar regions` | Table of every region: control, per-side dead, per-side rate (deaths/hr), bases held (`C-W`) |
 | `foxwar events [N]` | Last N base/structure events (default 30), from foxholestats |
 | `foxwar watch [SECS]` | Live view — map + most-active regions + events + summary, redrawn every `SECS` (default 60) |
 | `foxwar poll [SECS]` | Headless: keeps casualty tracking fresh, prints new events. For a spare pane or a service |
@@ -76,13 +79,15 @@ Flags: `--shard 1|2|3` (default 1), `--no-color`, `--blink` (blink the `‼` mar
 
 ## tmux status bar
 
-`foxwar tmux` prints something like `FH140 d75  VT 24-17 C+7  ☠ 47/53  3.0k  ‼2`.
+`foxwar tmux` prints something like
+`FH140 d75  VT 24-17 C+7  B 243-188  ☠ 47/53  3.0k  ‼2` — war/day, victory towns
+and lead, **B**ases held, casualty split %, players, invasion alerts.
 It serves a cached line instantly and refreshes in the background, so it's cheap
 to call on every status redraw:
 
 ```tmux
 set -g status-right '#[fg=red] ⚔ #(~/.local/bin/foxwar tmux) #[default] %H:%M '
-set -g status-right-length 90
+set -g status-right-length 100
 ```
 
 ## Continuous tracking (optional)
@@ -130,6 +135,15 @@ the API supports it.
 
 The map's `⚔` / `‼` and per-region rates make the active front obvious at a
 glance.
+
+### Bases held
+
+**Bases held** counts the relic and town bases each faction currently owns
+(icon types 45 / 56 / 57 / 58 in the map data — keeps are excluded). It's a
+map-dominance measure that moves slowly and independently of the victory-town
+race, and it matches the **"Captures"** figure on foxholestats.com exactly.
+`foxwar regions` shows the same `C-W` split per region, so you can see whether a
+`contested` hex is `7-1` or `4-4`.
 
 ## Configuration
 

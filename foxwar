@@ -4,14 +4,15 @@
 Data: the official Foxhole War API (war state, per-region casualties), the
 Steam concurrent-player count, and foxholestats.com's Live Event Log (scraped -
 it has 72h of history and no official equivalent). Renders casualties, the
-victory-town race, per-region control, an ASCII front-line map with invasion
+victory-town race, base control (relic + town bases held - the "Captures" tally
+foxholestats shows), per-region control, an ASCII front-line map with invasion
 markers, and the capture log.
 
 Usage:
-  foxwar                 summary: victory-town race, per-side casualties and
-                         rate, players, invasion alerts, last 8 events
+  foxwar                 summary: victory-town race, bases held, per-side
+                         casualties and rate, players, invasion alerts, events
   foxwar map             ASCII hex map; regions with an invasion alert are flagged
-  foxwar regions         table: control, per-side casualties and rate
+  foxwar regions         table: control, per-side casualties and rate, bases held
   foxwar events [N]      last N base/structure events (default 30)
   foxwar watch [SECS]    live: map + most-active regions + events + summary (60s)
   foxwar poll [SECS]     headless: refresh casualty tracking, print new events
@@ -186,6 +187,10 @@ def api(path):
 
 # keep, relic base, town base t1-3 - the capturable bases that mark a foothold
 BASE_ICONS = (27, 45, 56, 57, 58)
+# relic + town bases only (no keeps): the count of major bases a faction holds.
+# Matches the "Captures" tally foxholestats.com shows (verified against its
+# embedded state blob).
+ASSET_ICONS = (45, 56, 57, 58)
 
 
 def hex_data(name):
@@ -199,6 +204,7 @@ def hex_data(name):
         rep = {}
 
     held = {"COLONIALS": 0, "WARDENS": 0}
+    bases = {"COLONIALS": 0, "WARDENS": 0}
     vt = {"COLONIALS": 0, "WARDENS": 0}
     for m in d.get("mapItems", []):
         it, t, fl = m["iconType"], m["teamId"], m.get("flags", 0)
@@ -206,6 +212,8 @@ def hex_data(name):
             continue
         if t in held:
             held[t] += 1
+        if it in ASSET_ICONS and t in bases:
+            bases[t] += 1
         if fl & 0x01 and not fl & 0x10 and t in vt:   # victory base, not scorched
             vt[t] += 1
 
@@ -219,6 +227,7 @@ def hex_data(name):
 
     return {
         "ctrl": ctrl, "vt": vt,
+        "col_bases": bases["COLONIALS"], "war_bases": bases["WARDENS"],
         "col_cas": rep.get("colonialCasualties", 0),
         "war_cas": rep.get("wardenCasualties", 0),
         "enlist": rep.get("totalEnlistments", 0),
@@ -468,7 +477,9 @@ def totals(war, hexes):
     day = max((h["day"] for h in hexes.values()), default=0)
     cvt = sum(h["vt"]["COLONIALS"] for h in hexes.values())
     wvt = sum(h["vt"]["WARDENS"] for h in hexes.values())
-    return col, wr, enl, day, cvt, wvt
+    cb = sum(h["col_bases"] for h in hexes.values())
+    wb = sum(h["war_bases"] for h in hexes.values())
+    return col, wr, enl, day, cvt, wvt, cb, wb
 
 
 def region_rates():
@@ -545,7 +556,7 @@ def _invasion_line(invasions):
 
 
 def summary(war, hexes, invasions, players=None):
-    col, wr, enl, day, cvt, wvt = totals(war, hexes)
+    col, wr, enl, day, cvt, wvt, cb, wb = totals(war, hexes)
     tot = col + wr or 1
     need = war["requiredVictoryTowns"]
     winner = war["winner"]
@@ -558,6 +569,10 @@ def summary(war, hexes, invasions, players=None):
          f"Victory towns   {COL(str(cvt))} Colonial   {WAR(str(wvt))} Warden"
          f"   (need {need} to win)",
          "  " + bar(cvt / max(cvt + wvt, 1)),
+         "",
+         f"Bases held      {COL(str(cb))} Colonial   {WAR(str(wb))} Warden"
+         f"   {NEU('(relic + town)')}",
+         "  " + bar(cb / max(cb + wb, 1)),
          "",
          f"Casualties      {COL(f'{col:>10,}')}  {col / tot:5.1%} Colonial{cr[0]}",
          f"                {WAR(f'{wr:>10,}')}  {wr / tot:5.1%} Warden{cr[1]}",
@@ -583,7 +598,7 @@ def regions(war, hexes, invasions, limit=None, by="dead"):
     if limit:
         rows = rows[:limit]
     out = [BOLD(f"{'Region':<11}{'Control':<11}{'':2}"
-               f"{'dead C':>10} /{'dead W':>10}   {'C/hr':>6} {'W/hr':>6}")]
+               f"{'dead C':>10} /{'dead W':>10}   {'C/hr':>6} {'W/hr':>6}   {'bases':>7}")]
     for name, h in rows:
         ctrl = h["ctrl"]
         flag = (ALERT("‼") if name in invasions
@@ -591,8 +606,10 @@ def regions(war, hexes, invasions, limit=None, by="dead"):
         cpm, wpm = rr.get(name, (None, None))
         cr = COL(f"{cpm * 60:>6,.0f}") if cpm else f"{('·' if cpm == 0 else ''):>6}"
         wrt = WAR(f"{wpm * 60:>6,.0f}") if wpm else f"{('·' if wpm == 0 else ''):>6}"
+        cbn, wbn = h["col_bases"], h["war_bases"]
+        bases = f"{COL(f'{cbn:>3}')}-{WAR(str(wbn))}"
         out.append(f"{HEXES[name][2]:<11}{TINT[ctrl](f'{ctrl:<11}')}{flag} "
-                   f"{h['col_cas']:>10,} /{h['war_cas']:>10,}   {cr} {wrt}")
+                   f"{h['col_cas']:>10,} /{h['war_cas']:>10,}   {cr} {wrt}   {bases}")
     return "\n".join(out)
 
 
@@ -666,11 +683,12 @@ TMUX_TTL = int(os.environ.get("FOXWAR_TMUX_TTL", "300"))
 
 
 def tmux_line(war, hexes, invasions, players=None):
-    col, wr, _, day, cvt, wvt = totals(war, hexes)
+    col, wr, _, day, cvt, wvt, cb, wb = totals(war, hexes)
     tot = col + wr or 1
     lead = cvt - wvt
     arrow = "C+" if lead > 0 else ("W+" if lead < 0 else "=")
-    s = f"FH{war['warNumber']} d{day}  VT {cvt}-{wvt} {arrow}{abs(lead)}  ☠ {col / tot * 100:.0f}/{wr / tot * 100:.0f}"
+    s = (f"FH{war['warNumber']} d{day}  VT {cvt}-{wvt} {arrow}{abs(lead)}"
+         f"  B {cb}-{wb}  ☠ {col / tot * 100:.0f}/{wr / tot * 100:.0f}")
     if players is not None:
         s += f"  {players / 1000:.1f}k" if players >= 1000 else f"  {players}"
     if invasions:
@@ -769,13 +787,14 @@ def main():
                 print(BOLD("Recent events") + NEU("  (foxholestats.com)"))
                 print(events_view(10))
                 print()
-                col, wr, _, day, cvt, wvt = totals(war, hexes)
+                col, wr, _, day, cvt, wvt, cb, wb = totals(war, hexes)
                 pc = player_count()
                 rates = casualty_rates()
                 dead = (f"☠ {COL(f'+{rates[0] * 60:,.0f}')}/{WAR(f'+{rates[1] * 60:,.0f}')}/hr"
                         if rates else f"☠ {col + wr:,}")
                 print(f"War #{war['warNumber']}  Day {day}   "
                       f"VT {COL(str(cvt))}-{WAR(str(wvt))}/{war['requiredVictoryTowns']}"
+                      f"   bases {COL(str(cb))}-{WAR(str(wb))}"
                       f"   {dead}" + (f"   {pc:,} players" if pc else ""))
                 print(NEU(f"updated {time.strftime('%H:%M:%S')} - Ctrl-C to quit"))
                 sys.stdout.flush()
