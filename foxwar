@@ -34,8 +34,6 @@ Casualty rates need ~2 min of local history and sharpen over ~30 min; keep
 `foxwar poll` (the foxwar-poll systemd service) or the tmux bar running to
 build it. Everything is cached under ~/.cache/foxwar.
 """
-from __future__ import annotations
-
 import concurrent.futures
 import gzip
 import json

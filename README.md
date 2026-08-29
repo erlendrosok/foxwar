@@ -7,7 +7,7 @@ foxholestats.com's event log, and renders the war at a glance: the victory-town
 race, per-side casualties and casualty rate, an ASCII front-line map with
 **invasion alerts**, and a live feed of base captures.
 
-Single file, Python 3.8+, standard library only. No install step beyond dropping
+Single file, Python 3.7+, standard library only. No install step beyond dropping
 it on your `PATH`.
 
 ```
@@ -58,7 +58,7 @@ foxwar
 ```
 
 Or just drop the single `foxwar` file anywhere on your `PATH` and `chmod +x` it.
-Requires Python 3.8+ and nothing else — no `pip install`.
+Requires Python 3.7+ and nothing else — no `pip install`.
 
 ## Commands
 

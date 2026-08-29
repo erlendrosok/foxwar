@@ -22,7 +22,7 @@ case ":$PATH:" in
 esac
 
 if ! command -v python3 >/dev/null 2>&1; then
-    echo "  warning: python3 not found (foxwar needs Python 3.8+)"
+    echo "  warning: python3 not found (foxwar needs Python 3.7+)"
 fi
 
 if [ "${1:-}" = "--service" ]; then
